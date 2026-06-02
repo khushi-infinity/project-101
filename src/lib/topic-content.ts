@@ -1,3 +1,5 @@
+import { fetchYouTubeSearchResults } from "@/lib/youtube";
+
 export type TopicDifficulty = "easy" | "medium" | "hard";
 
 export type TopicVideoCard = {
@@ -129,24 +131,25 @@ function extractKeywords(text: string, limit = 8) {
   ).slice(0, limit);
 }
 
-function formatViewCount(viewCount: number) {
-  if (viewCount >= 1_000_000) {
-    return `${(viewCount / 1_000_000).toFixed(1).replace(/\.0$/, "")}M views`;
-  }
-
-  if (viewCount >= 1_000) {
-    return `${Math.round(viewCount / 1_000)}K views`;
-  }
-
-  return `${viewCount} views`;
-}
-
 function formatDuration(lengthSeconds: number) {
   if (!lengthSeconds || Number.isNaN(lengthSeconds)) return "";
 
   const minutes = Math.floor(lengthSeconds / 60);
   const seconds = lengthSeconds % 60;
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function parseViewCountFromText(viewCountText: string) {
+  const normalized = viewCountText.replace(/,/g, "").trim();
+  const match = normalized.match(/([\d.]+)\s*([KM]?)\s*views?/i);
+  if (!match) return 0;
+
+  const value = Number.parseFloat(match[1] || "0");
+  const suffix = (match[2] || "").toUpperCase();
+  if (Number.isNaN(value)) return 0;
+  if (suffix === "M") return Math.round(value * 1_000_000);
+  if (suffix === "K") return Math.round(value * 1_000);
+  return Math.round(value);
 }
 
 function getBestThumbnail(videoThumbnails?: Array<{ quality?: string; url?: string }>) {
@@ -236,142 +239,96 @@ async function fetchWikipediaSummary(query: string) {
 
 async function fetchYoutubeCards(query: string): Promise<TopicVideoCard[]> {
   const queries = unique([query, `${query} lecture`, `${query} tutorial`, `${query} playlist`]);
+  const results = await Promise.all(queries.map((singleQuery) => fetchYouTubeSearchResults(singleQuery, 8)));
 
-  // Collect raw results per query so we can compute a simple relevance score
-  const rawPerQuery = await Promise.all(
-    queries.map(async (singleQuery) => {
-      try {
-        const response = await fetch(
-          `https://y.com.sb/api/v1/search?q=${encodeURIComponent(singleQuery)}&type=video`,
-          { cache: "no-store" },
-        );
-
-        if (!response.ok) return [];
-
-        const data = (await response.json()) as Array<{
-          type: string;
-          title?: string;
-          videoId?: string;
-          author?: string;
-          authorUrl?: string;
-          viewCount?: number;
-          viewCountText?: string;
-          publishedText?: string;
-          lengthSeconds?: number;
-          videoThumbnails?: Array<{ quality?: string; url?: string }>;
-        }>;
-
-        return data.filter((item) => item.type === "video");
-      } catch {
-        return [];
-      }
-    }),
-  );
-
-  // Aggregate occurrences and compute a combined relevance+popularity score
   const aggregate = new Map<
     string,
     {
-      item: (typeof rawPerQuery)[number][number] | null;
+      item: (typeof results)[number][number] | null;
       freq: number;
       posScore: number;
-      viewCount: number;
       viewCountText: string;
+      publishedText: string;
+      description: string;
     }
   >();
 
-  for (let qIndex = 0; qIndex < rawPerQuery.length; qIndex++) {
-    const list = rawPerQuery[qIndex] || [];
+  for (let qIndex = 0; qIndex < results.length; qIndex++) {
+    const list = results[qIndex] || [];
     for (let i = 0; i < list.length; i++) {
       const it = list[i];
       if (!it.videoId) continue;
 
-      const entry = aggregate.get(it.videoId) ?? { item: it, freq: 0, posScore: 0, viewCount: it.viewCount || 0, viewCountText: it.viewCountText || formatViewCount(it.viewCount || 0) };
+      const entry =
+        aggregate.get(it.videoId) ??
+        {
+          item: it,
+          freq: 0,
+          posScore: 0,
+          viewCountText: it.viewCountText || "YouTube video",
+          publishedText: it.publishedText || "",
+          description: it.description || "",
+        };
+
       entry.freq += 1;
-      // Add a small positional boost for earlier positions
       entry.posScore += 1 / (i + 1);
-      // prefer the largest viewCount seen
-      entry.viewCount = Math.max(entry.viewCount || 0, it.viewCount || 0);
-      entry.viewCountText = entry.viewCountText || it.viewCountText || formatViewCount(entry.viewCount || 0);
+      entry.viewCountText = entry.viewCountText || it.viewCountText || "YouTube video";
+      entry.publishedText = entry.publishedText || it.publishedText || "";
+      entry.description = entry.description || it.description || "";
       aggregate.set(it.videoId, entry);
     }
   }
 
-  const scored: Array<{ id: string; score: number; card: TopicVideoCard }> = [];
+  const scored: Array<{ score: number; card: TopicVideoCard }> = [];
 
-  for (const [id, meta] of aggregate.entries()) {
+  for (const meta of aggregate.values()) {
     if (!meta.item) continue;
     const it = meta.item;
-    // Relevance score based on frequency and positional score
     const relevanceScore = meta.freq * 1.5 + meta.posScore;
-    // Popularity score using a log scale so views don't dominate
-    const popularityScore = Math.log10((meta.viewCount || 0) + 1);
+    const popularityScore = Math.log10(parseViewCountFromText(meta.viewCountText) + 1);
     const combined = relevanceScore * 2 + popularityScore;
 
-    const card = {
-      videoId: it.videoId || id,
-      title: it.title || "Untitled",
-      author: it.author || "YouTube",
-      channelUrl: it.authorUrl ? `https://www.youtube.com${it.authorUrl}` : `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
-      thumbnailUrl: getBestThumbnail(it.videoThumbnails),
-      viewCount: meta.viewCount || 0,
-      viewCountText: meta.viewCountText || formatViewCount(meta.viewCount || 0),
-      lengthSeconds: it.lengthSeconds || 0,
-      publishedText: it.publishedText || "",
-      url: `https://www.youtube.com/watch?v=${it.videoId}`,
-      summary: buildVideoSummary(
-        {
-          title: it.title || "",
-          author: it.author || "YouTube",
-          viewCountText: meta.viewCountText || formatViewCount(meta.viewCount || 0),
-          lengthSeconds: it.lengthSeconds || 0,
-          publishedText: it.publishedText || "",
-        },
-        query,
-      ),
-    } satisfies TopicVideoCard;
-
-    scored.push({ id, score: combined, card });
+    scored.push({
+      score: combined,
+      card: {
+        videoId: it.videoId,
+        title: it.title || "Untitled",
+        author: it.author || "YouTube",
+        channelUrl: it.channelUrl,
+        thumbnailUrl: getBestThumbnail([{ url: it.thumbnailUrl }]),
+        viewCount: parseViewCountFromText(meta.viewCountText),
+        viewCountText: meta.viewCountText,
+        lengthSeconds: 0,
+        publishedText: meta.publishedText,
+        url: it.url,
+        summary: buildVideoSummary(
+          {
+            title: it.title || "",
+            author: it.author || "YouTube",
+            viewCountText: meta.viewCountText,
+            lengthSeconds: 0,
+            publishedText: meta.publishedText,
+          },
+          `${query} ${meta.description}`,
+        ),
+      },
+    });
   }
 
-  // Sort by combined score (relevance first, then popularity via combined metric)
-  return scored
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 8)
-    .map((s) => s.card);
+  return scored.sort((a, b) => b.score - a.score).slice(0, 8).map((item) => item.card);
 }
 
 async function fetchYoutubePlaylists(query: string): Promise<TopicPlaylistCard[]> {
-  try {
-    const response = await fetch(
-      `https://y.com.sb/api/v1/search?q=${encodeURIComponent(query)}&type=playlist`,
-      { cache: "no-store" },
-    );
-
-    if (!response.ok) return [];
-
-    const data = (await response.json()) as Array<{
-      type: string;
-      title?: string;
-      playlistId?: string;
-      playlistThumbnail?: string;
-      videoCount?: number;
-    }>;
-
-    return data
-      .filter((item) => item.type === "playlist" && item.playlistId && item.title)
-      .slice(0, 3)
-      .map((item) => ({
-        playlistId: item.playlistId ?? "",
-        title: item.title ?? query,
-        thumbnailUrl: item.playlistThumbnail || "",
-        videoCount: item.videoCount && item.videoCount > 0 ? item.videoCount : 0,
-        url: `https://www.youtube.com/playlist?list=${item.playlistId}`,
-        summary: `A playlist that groups multiple explanations for ${query} into one watchlist.`,
-      }));
-  } catch {
-    return [];
-  }
+  return [
+    {
+      playlistId: `youtube-search-${encodeURIComponent(query)}`,
+      title: `${query} on YouTube`,
+      thumbnailUrl: `https://i.ytimg.com/vi/${encodeURIComponent(query)}/hqdefault.jpg`,
+      videoCount: 0,
+      url: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAw%253D%253D`,
+      summary: `Open a YouTube search filtered toward playlists and longer explanations for ${query}.`,
+    },
+  ];
 }
 
 async function fetchGoogleBooks(query: string): Promise<TopicReadingResource[]> {
