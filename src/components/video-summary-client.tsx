@@ -147,8 +147,8 @@ export default function VideoSummaryClient({ videos, topicQuery = "" }: Props) {
         onChange={(event) => {
           const nextId = event.target.value;
           setSelectedVideoId(nextId);
-          const nextVideo = videos.find((video) => video.videoId === nextId);
-          setSummary(nextVideo?.summary || "Select a video and generate a summary.");
+          setSummary(null);
+          setIsSummaryOpen(false);
           setError(null);
         }}
         className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-blue-400"
